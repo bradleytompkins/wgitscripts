@@ -285,10 +285,24 @@ foreach ($p in (Get-Process)) {
         if (-not ($nameBad -or $exeSus)) { continue }   # cheap gate before expensive checks
         $mPath = $m.FileName
         if ($nameBad) {
-            $hit = $true
-            Add-Finding 'SideLoad' 'CRITICAL' `
-                ("Known SOGU loader '{0}' loaded by '{1}' from {2} [sig: {3}]" -f `
-                 $mName,$p.ProcessName,$mPath,(Get-Sig $mPath))
+            # A bad-NAME match alone is NOT sufficient: several of these names are
+            # legitimate, ubiquitously-loaded DLLs (coreclr.dll = the .NET runtime,
+            # libcurl.dll, ZIPDLL.dll). Their genuine copies are vendor-signed and
+            # load from normal paths; the malicious copy is unsigned and/or loads
+            # from a suspicious path. Require that corroboration before flagging.
+            # The hash check immediately below is the authoritative confirmation and
+            # still fires even for a (stolen-cert) signed copy.
+            $sig     = Get-Sig $mPath
+            $pathSus = $mPath -match $SuspiciousPathPattern
+            if ($sig -ne 'Valid') {
+                $hit = $true
+                $sev = if ($pathSus) { 'CRITICAL' } else { 'HIGH' }
+                Add-Finding 'SideLoad' $sev `
+                    ("Bad-named DLL '{0}' loaded by '{1}' from {2} [sig: {3}, suspPath: {4}]" -f `
+                     $mName,$p.ProcessName,$mPath,$sig,[bool]$pathSus)
+            }
+            # else: a validly-signed DLL of the same name -> legitimate; ignore here
+            # and let the hash check below catch a stolen-cert match if present.
         }
         $h = Get-Md5 $mPath
         if ($h -and $BadHashes.ContainsKey($h)) {
