@@ -4,7 +4,7 @@
 #  SOGU / PlugX Triage
 #  Outputs: INFECTED / SUSPICIOUS / CLEAN
 #  Safe: read-only. Never deletes or modifies anything.
-#  USB checks run automatically if a removable drive is found.
+#  Worm-root checks run on ALL removable drives AND the C: drive.
 # ============================================================
 
 # ---- IOCs --------------------------------------------------
@@ -20,7 +20,7 @@ $KnownHashes   = @{
 $StagingPathRx = '\\[A-Z0-9]{16}\\[a-zA-Z0-9+/]{5,}={0,3}$'
 $IntelDirRx    = '\\AppData\\Roaming\\Intel\\'
 
-# ---- Scan roots --------------------------------------------
+# ---- Scan roots (deep scan in check 2) ---------------------
 $Roots = @($env:ProgramData, $env:APPDATA, $env:LOCALAPPDATA, $env:USERPROFILE) |
     Where-Object { $_ -and (Test-Path $_) } | Sort-Object -Unique
 
@@ -41,7 +41,7 @@ function IsCloudPlaceholder([System.IO.FileInfo]$f) {
     try { return (([int]$f.Attributes -band 0x441000) -ne 0) } catch { return $false }
 }
 
-# RECYCLER.BIN / RECYCLERS.BIN folder check - shared by USB and fixed-drive scans.
+# RECYCLER.BIN / RECYCLERS.BIN folder check - shared by all root scans.
 # Legit Windows recycle bins are 'RECYCLER' (XP NTFS), 'RECYCLED' (FAT) or
 # '$Recycle.Bin' (Vista+); the '.BIN' variants are the PlugX/Sogu masquerade.
 function CheckRecycler([string]$rootPath, [string]$context) {
@@ -55,43 +55,68 @@ function CheckRecycler([string]$rootPath, [string]$context) {
     }
 }
 
+# Full worm-root check for a drive root: RECYCLER masquerade + hidden
+# single-space payload folder + .lnk infection lure at the root.
+function CheckDriveRoot([string]$rootPath, [string]$context) {
+    CheckRecycler $rootPath $context
+
+    $sp = Join-Path $rootPath ' '
+    if (Test-Path -LiteralPath $sp) {
+        Hit 'HIGH' "Hidden space-folder at $rootPath ($context)"
+    }
+
+    Get-ChildItem -LiteralPath $rootPath -Filter '*.lnk' -Force -EA SilentlyContinue |
+        ForEach-Object { Hit 'HIGH' "Suspicious .lnk at drive root: $($_.FullName) ($context)" }
+}
+
 # ============================================================
 #  CHECKS
 # ============================================================
 
-# 1. USB checks — only runs if a removable drive is present
+# ---- Determine which drive roots to scan -------------------
+# Removable drives. NOTE: PSDrive .Name is already the bare letter (e.g. 'E'),
+# so use that instead of Root.TrimEnd('\') which leaves a trailing colon and
+# breaks Get-Volume -DriveLetter. Fall back to USB bus type for USB sticks/SSDs
+# that report DriveType=Fixed.
 $removableDrives = Get-PSDrive -PSProvider FileSystem -EA SilentlyContinue | Where-Object {
-    try { (Get-Volume -DriveLetter ($_.Root.TrimEnd('\')) -EA Stop).DriveType -eq 'Removable' }
-    catch { $false }
+    $letter = $_.Name
+    if ($letter -notmatch '^[A-Za-z]$') { return $false }
+    try {
+        $vol = Get-Volume -DriveLetter $letter -EA Stop
+        if ($vol.DriveType -eq 'Removable') { return $true }
+        ((Get-Partition -DriveLetter $letter -EA Stop | Get-Disk -EA Stop).BusType -eq 'USB')
+    } catch { $false }
 }
+$removableRoots = @($removableDrives | ForEach-Object { $_.Root })
 
-if ($removableDrives) {
-    Write-Host "  [!] Removable drive(s) detected - running USB checks..." -ForegroundColor Yellow
-    foreach ($drive in $removableDrives) {
-        # RECYCLER.BIN / RECYCLERS.BIN with desktop.ini = shell-folder masquerade
-        CheckRecycler $drive.Root 'USB worm staging folder'
-        # Hidden single-space folder = payload hiding spot
-        $sp = Join-Path $drive.Root ' '
-        if (Test-Path -LiteralPath $sp) {
-            Hit 'HIGH' "Hidden space-folder at $($drive.Root) (USB worm payload folder)"
-        }
-        # Shortcut at drive root named after the drive = infection lure
-        Get-ChildItem -LiteralPath $drive.Root -Filter '*.lnk' -Force -EA SilentlyContinue |
-        ForEach-Object { Hit 'HIGH' "Suspicious .lnk at drive root: $($_.FullName) (USB worm lure)" }
-    }
-} else {
-    Write-Host "  No removable drives found - USB checks skipped." -ForegroundColor DarkGray
-}
-
-# 1b. Fixed-drive roots - PlugX/Sogu also stages RECYCLER.BIN on fixed drives,
-#     not just removable media. Root-only Test-Path, no recursion here.
+# Fixed drives (for the cheap RECYCLER-only sweep on non-C fixed roots).
 $fixedRoots = try {
     [System.IO.DriveInfo]::GetDrives() |
         Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
         ForEach-Object { $_.RootDirectory.FullName }
 } catch { @() }
-foreach ($fr in $fixedRoots) {
-    CheckRecycler $fr 'RECYCLER folder on fixed-drive root'
+
+$systemRoot = if ($env:SystemDrive) { "$env:SystemDrive\" } else { 'C:\' }
+
+# Full worm-root checks run on every removable drive PLUS the C: (system) drive.
+$fullCheckRoots    = @($removableRoots + $systemRoot) | Sort-Object -Unique
+# Any other fixed drives still get the cheap RECYCLER folder check.
+$recyclerOnlyRoots = @($fixedRoots | Where-Object { $fullCheckRoots -notcontains $_ })
+
+# 1. Drive-root worm checks
+if ($removableRoots.Count) {
+    Write-Host "  [!] Removable drive(s) detected: $($removableRoots -join ', ')" -ForegroundColor Yellow
+} else {
+    Write-Host "  No removable drives found." -ForegroundColor DarkGray
+}
+Write-Host "  Full root checks on: $($fullCheckRoots -join ', ')" -ForegroundColor Yellow
+
+foreach ($r in $fullCheckRoots) {
+    $ctx = if ($removableRoots -contains $r) { 'removable drive root' } else { 'system drive root' }
+    CheckDriveRoot $r $ctx
+}
+foreach ($r in $recyclerOnlyRoots) {
+    CheckRecycler $r 'RECYCLER folder on fixed-drive root'
 }
 
 # 2. Filesystem: bad names, staging paths, side-load triads
